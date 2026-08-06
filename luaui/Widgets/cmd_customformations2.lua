@@ -6,7 +6,7 @@ function widget:GetInfo()
         name      = "CustomFormations2",
         desc      = "Allows you to draw your own formation line.",
         author    = "Errrrrrr, Niobium", -- based on 'Custom Formations' by jK and gunblob
-        version   = "v4.4",
+        version   = "v4.5",
         date      = "June, 2023",
         license   = "GNU GPL, v2 or later",
         layer     = 10000,
@@ -48,12 +48,12 @@ local minPathSpacingSq = 50 * 50
 local minFormationLength = 20
 
 -- How long should algorithms take. (~0.1 gives visible stutter, default: 0.05)
-local maxHngTime = 0.01 -- Desired maximum time for hungarian algorithm
 local maxNoXTime = 0.01 -- Strict maximum time for backup algorithm
 
-local defaultHungarianUnits	= 20 -- Need a baseline to start from when no config data saved
-local minHungarianUnits		= 10 -- If we kept reducing maxUnits it can get to a point where it can never increase, so we enforce minimums on the algorithms.
-local unitIncreaseThresh	= 0.85 -- We only increase maxUnits if the units are great enough for time to be meaningful
+-- Fill the line edges-first: nearest unit to either edge, then the other edge,
+-- then the midpoint, then midpoints of each half, bisecting inward. Each spot greedily
+-- takes the nearest unassigned unit.
+local maxEdgeInUnits = 250 -- Max units edge-in may sort in one go (O(n2) greedy); NoX handles bigger drags. Configurable.
 
 -- Alpha loss per second after releasing mouse
 local lineFadeRate = 2.0
@@ -104,7 +104,6 @@ local formationOrdersShifted = nil
 --------------------------------------------------------------------------------
 -- Globals
 --------------------------------------------------------------------------------
-local maxHungarianUnits = defaultHungarianUnits -- Also set when loading config
 
 local fNodes = {} -- Formation nodes, filled as we draw
 local fDists = {} -- fDists[i] = distance from node 1 to node i
@@ -677,8 +676,8 @@ function widget:MouseRelease(mx, my, mButton)
                 local interpNodes = GetInterpNodes(mUnits)
 
                 local orders
-                if (#mUnits <= maxHungarianUnits) then
-                    orders = GetOrdersHungarian(interpNodes, mUnits, #mUnits, shift and not meta)
+                if (#mUnits <= maxEdgeInUnits) then
+                    orders = GetOrdersEdgeIn(interpNodes, mUnits, #mUnits, shift and not meta)
                 else
                     orders = GetOrdersNoX(interpNodes, mUnits, #mUnits, shift and not meta)
                 end
@@ -900,22 +899,115 @@ end
 
 
 ---------------------------------------------------------------------------------------------------------
--- Config
----------------------------------------------------------------------------------------------------------
-
-function widget:GetConfigData() -- Saving
-    return {
-        ['maxHungarianUnits'] = maxHungarianUnits,
-    }
-end
-function widget:SetConfigData(data) -- Loading
-    maxHungarianUnits = data['maxHungarianUnits'] or defaultHungarianUnits
-end
-
-
----------------------------------------------------------------------------------------------------------
 -- Matching Algorithms
 ---------------------------------------------------------------------------------------------------------
+
+function GetOrdersEdgeIn(nodes, units, unitCount, shifted)
+    -- Spots on the line are filled edges-first, bisecting inward.
+    -- Fill order: the edge nearest to any unit, then the opposite edge, then the
+    -- midpoint, then the midpoints of each half (breadth-first), and so on.
+    -- Each spot greedily takes the nearest still-unassigned unit, so the line's
+    -- overall shape forms immediately even when most units are far away.
+
+    -- Cache unit positions
+    local ux, uz, uID = {}, {}, {}
+    local m = 0
+    for u = 1, unitCount do
+        local x, _, z
+        if shifted then
+            x, _, z = GetUnitFinalPosition(units[u])
+        else
+            x, _, z = spGetUnitPosition(units[u])
+        end
+        if x then
+            m = m + 1
+            ux[m] = x
+            uz[m] = z
+            uID[m] = units[u]
+        end
+    end
+
+    if m == 0 then
+        return {}
+    end
+
+    -- Decide which edge is filled first: the one closest to any unit
+    local firstEdge, secondEdge = 1, unitCount
+    if unitCount > 1 then
+        local bestFirst, bestLast = huge, huge
+        local n1, nN = nodes[1], nodes[unitCount]
+        for i = 1, m do
+            local dx, dz = n1[1] - ux[i], n1[3] - uz[i]
+            local d = dx*dx + dz*dz
+            if d < bestFirst then bestFirst = d end
+            dx, dz = nN[1] - ux[i], nN[3] - uz[i]
+            d = dx*dx + dz*dz
+            if d < bestLast then bestLast = d end
+        end
+        if bestLast < bestFirst then
+            firstEdge, secondEdge = unitCount, 1
+        end
+    end
+
+    -- Build the fill order: both edges, then bisection of the index range.
+    -- Each level emits all left-half midpoints before all right-half midpoints
+    -- (bit-reversal order): plain left-to-right level order would degrade into
+    -- long sequential runs once levels get wide.
+    local fillOrder = { firstEdge }
+    local fillCount = 1
+    if unitCount > 1 then
+        fillCount = 2
+        fillOrder[2] = secondEdge
+
+        local level = { {1, unitCount} }
+        while level[1] do
+            local lefts, rights = {}, {}
+            for i = 1, #level do
+                local lo, hi = level[i][1], level[i][2]
+                if hi - lo >= 2 then
+                    local mid = floor((lo + hi) * 0.5)
+                    fillCount = fillCount + 1
+                    fillOrder[fillCount] = mid
+                    lefts[#lefts + 1] = {lo, mid}
+                    rights[#rights + 1] = {mid, hi}
+                end
+            end
+            for i = 1, #rights do
+                lefts[#lefts + 1] = rights[i]
+            end
+            level = lefts
+        end
+    end
+
+    -- Each spot, in fill order, takes the nearest unassigned unit
+    local taken = {}
+    local orders = {}
+    local oCount = 0
+    for f = 1, fillCount do
+        if oCount >= m then
+            break
+        end
+        local node = nodes[fillOrder[f]]
+        local nx, nz = node[1], node[3]
+        local best, bestDist
+        for i = 1, m do
+            if not taken[i] then
+                local dx, dz = nx - ux[i], nz - uz[i]
+                local d = dx*dx + dz*dz
+                if not best or d < bestDist then
+                    best = i
+                    bestDist = d
+                end
+            end
+        end
+        taken[best] = true
+        oCount = oCount + 1
+        orders[oCount] = {uID[best], node}
+    end
+
+    return orders
+end
+
 
 function GetOrdersNoX(nodes, units, unitCount, shifted)
     -- Remember when  we start
@@ -1091,300 +1183,6 @@ function GetOrdersNoX(nodes, units, unitCount, shifted)
 end
 
 
-function GetOrdersHungarian(nodes, units, unitCount, shifted, adjustLimit)
-    -------------------------------------------------------------------------------------
-    -------------------------------------------------------------------------------------
-    -- (the following code is written by gunblob)
-    --   this code finds the optimal solution (slow, but effective!)
-    --   it uses the hungarian algorithm from http://www.public.iastate.edu/~ddoty/HungarianAlgorithm.html
-    --   if this violates gpl license please let gunblob and me know
-    -------------------------------------------------------------------------------------
-    -------------------------------------------------------------------------------------
-    local t = osclock()
-
-    --------------------------------------------------------------------------------------------
-    --------------------------------------------------------------------------------------------
-    -- cache node<->unit distances
-
-    local distances = {}
-    --for i = 1, unitCount do distances[i] = {} end
-
-    for i = 1, unitCount do
-
-        local uID = units[i]
-        local ux, uz
-
-        if shifted then
-            ux, _, uz = GetUnitFinalPosition(uID)
-        else
-            ux, _, uz = spGetUnitPosition(uID)
-        end
-		if ux then
-			distances[i] = {}
-			local dists = distances[i]
-			for j = 1, unitCount do
-
-				local nodePos = nodes[j]
-				local dx, dz = nodePos[1] - ux, nodePos[3] - uz
-				dists[j] = floor(sqrt(dx*dx + dz*dz) + 0.5)
-				-- Integer distances = greatly improved algorithm speed
-			end
-		end
-    end
-
-    --------------------------------------------------------------------------------------------
-    -- find optimal solution and send orders
-    local result = findHungarian(distances, unitCount)
-    --------------------------------------------------------------------------------------------
-    -- determine needed time and optimize the maxUnits limit
-
-    local delay = osclock() - t
-
-    if adjustLimit ~= false and (delay > maxHngTime) and (maxHungarianUnits > minHungarianUnits) then
-
-        -- Delay is greater than desired, we have to reduce units
-        maxHungarianUnits = maxHungarianUnits - 1
-    elseif adjustLimit ~= false then
-        -- Delay is less than desired, so thats OK
-        -- To make judgements we need number of units to be close to max
-        -- Because we are making predictions of time and we want them to be accurate
-        if (#units > maxHungarianUnits*unitIncreaseThresh) then
-
-            -- This implementation of Hungarian algorithm is O(n3)
-            -- Because we have less than maxUnits, but are altering maxUnits...
-            -- We alter the time, to 'predict' time we would be getting at maxUnits
-            -- We then recheck that against maxHngTime
-
-            local nMult = maxHungarianUnits / #units
-
-            if ((delay*nMult*nMult*nMult) < maxHngTime) then
-                maxHungarianUnits = maxHungarianUnits + 1
-            else
-                if (maxHungarianUnits > minHungarianUnits) then
-                    maxHungarianUnits = maxHungarianUnits - 1
-                end
-            end
-        end
-    end
-
-    -- Return orders
-    local orders = {}
-    for i = 1, unitCount do
-        local rPair = result[i]
-        orders[i] = {units[rPair[1]], nodes[rPair[2]]}
-    end
-
-    return orders
-end
-
-
-function findHungarian(array, n)
-    -- Vars
-    local colcover = {}
-    local rowcover = {}
-    local starscol = {}
-    local primescol = {}
-
-    -- Initialization
-    for i = 1, n do
-        rowcover[i] = false
-        colcover[i] = false
-        starscol[i] = false
-        primescol[i] = false
-    end
-
-    -- Subtract minimum from rows
-    for i = 1, n do
-        local aRow = array[i]
-        local minVal = aRow[1]
-        for j = 2, n do
-            if aRow[j] < minVal then
-                minVal = aRow[j]
-            end
-        end
-
-        for j = 1, n do
-            aRow[j] = aRow[j] - minVal
-        end
-    end
-
-    -- Subtract minimum from columns
-    for j = 1, n do
-        local minVal = array[1][j]
-        for i = 2, n do
-            if array[i][j] < minVal then
-                minVal = array[i][j]
-            end
-        end
-
-        for i = 1, n do
-            array[i][j] = array[i][j] - minVal
-        end
-    end
-
-    -- Star zeroes
-    for i = 1, n do
-        local aRow = array[i]
-        for j = 1, n do
-            if (aRow[j] == 0) and not colcover[j] then
-                colcover[j] = true
-                starscol[i] = j
-                break
-            end
-        end
-    end
-
-    -- Start solving system
-    while true do
-        -- Are we done ?
-        local done = true
-        for i = 1, n do
-            if not colcover[i] then
-                done = false
-                break
-            end
-        end
-
-        if done then
-            local pairings = {}
-            for i = 1, n do
-                pairings[i] = {i, starscol[i]}
-            end
-            return pairings
-        end
-
-        -- Not done
-        local r, c = stepPrimeZeroes(array, colcover, rowcover, n, starscol, primescol)
-        stepFiveStar(colcover, rowcover, r, c, n, starscol, primescol)
-    end
-end
-
-
-function doPrime(array, colcover, rowcover, n, starscol, r, c, rmax, primescol)
-    primescol[r] = c
-    local starCol = starscol[r]
-
-    if starCol then
-        rowcover[r] = true
-        colcover[starCol] = false
-
-        for i = 1, rmax do
-            if not rowcover[i] and (array[i][starCol] == 0) then
-                local rr, cc = doPrime(array, colcover, rowcover, n, starscol, i, starCol, rmax, primescol)
-                if rr then
-                    return rr, cc
-                end
-            end
-        end
-
-        return
-    else
-        return r, c
-    end
-end
-
-
-function stepPrimeZeroes(array, colcover, rowcover, n, starscol, primescol)
-    -- Infinite loop
-    while true do
-
-        -- Find uncovered zeros and prime them
-        for i = 1, n do
-            if not rowcover[i] then
-                local aRow = array[i]
-                for j = 1, n do
-                    if (aRow[j] == 0) and not colcover[j] then
-                        local i, j = doPrime(array, colcover, rowcover, n, starscol, i, j, i-1, primescol)
-                        if i then
-                            return i, j
-                        end
-                        break -- this row is covered
-                    end
-                end
-            end
-        end
-
-        -- Find minimum uncovered
-        local minVal = huge
-        for i = 1, n do
-            if not rowcover[i] then
-                local aRow = array[i]
-                for j = 1, n do
-                    if (aRow[j] < minVal) and not colcover[j] then
-                        minVal = aRow[j]
-                    end
-                end
-            end
-        end
-
-        -- There is the potential for minVal to be 0, very very rarely though. (Checking for it costs more than the +/- 0's)
-
-        -- Covered rows = +
-        -- Uncovered cols = -
-        for i = 1, n do
-            local aRow = array[i]
-            if rowcover[i] then
-                for j = 1, n do
-                    if colcover[j] then
-                        aRow[j] = aRow[j] + minVal
-                    end
-                end
-            else
-                for j = 1, n do
-                    if not colcover[j] then
-                        aRow[j] = aRow[j] - minVal
-                    end
-                end
-            end
-        end
-    end
-end
-
-
-function stepFiveStar(colcover, rowcover, row, col, n, starscol, primescol)
-    -- Star the initial prime
-    primescol[row] = false
-    starscol[row] = col
-    local ignoreRow = row -- Ignore the star on this row when looking for next
-
-    repeat
-        local noFind = true
-
-        for i = 1, n do
-
-            if (starscol[i] == col) and (i ~= ignoreRow) then
-
-                noFind = false
-
-                -- Unstar the star
-                -- Turn the prime on the same row into a star (And ignore this row (aka star) when searching for next star)
-
-                local pcol = primescol[i]
-                primescol[i] = false
-                starscol[i] = pcol
-                ignoreRow = i
-                col = pcol
-
-                break
-            end
-        end
-    until noFind
-
-    for i = 1, n do
-        rowcover[i] = false
-        colcover[i] = false
-        primescol[i] = false
-    end
-
-    for i = 1, n do
-        local scol = starscol[i]
-        if scol then
-            colcover[scol] = true
-        end
-    end
-end
-
-
 function widget:Initialize()
 	WG.customformations = {}
 	WG.customformations.getRepeatForSingleUnit = function()
@@ -1519,8 +1317,8 @@ function widget:Initialize()
 				if #mUnits > 0 then
 					local interpNodes = GetInterpNodes(mUnits)
 					local orders
-					if #mUnits <= maxHungarianUnits then
-						orders = GetOrdersHungarian(interpNodes, mUnits, #mUnits, shift and not meta)
+					if #mUnits <= maxEdgeInUnits then
+						orders = GetOrdersEdgeIn(interpNodes, mUnits, #mUnits, shift and not meta)
 					else
 						orders = GetOrdersNoX(interpNodes, mUnits, #mUnits, shift and not meta)
 					end
@@ -1614,8 +1412,8 @@ function widget:Initialize()
             end
             local interpNodes = GetInterpNodes(mUnits)
             local orders
-            if #mUnits <= maxHungarianUnits then
-                orders = GetOrdersHungarian(interpNodes, mUnits, #mUnits, shifted, false)
+            if #mUnits <= maxEdgeInUnits then
+                orders = GetOrdersEdgeIn(interpNodes, mUnits, #mUnits, shifted)
             else
                 orders = GetOrdersNoX(interpNodes, mUnits, #mUnits, shifted)
             end
